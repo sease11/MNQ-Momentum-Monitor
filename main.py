@@ -57,8 +57,13 @@ async def tradingview(request: Request):
     if not hmac.compare_digest(token, secret):
         raise HTTPException(401, "Unauthorized")
     symbol = str(payload.get("symbol", ""))
-    if not symbol or len(symbol) > 64 or ("MNQ" not in symbol.upper() and "NQ" not in symbol.upper()):
-        raise HTTPException(422, "MNQ/NQ symbol required")
+    normalized_symbol = symbol.upper().split(":")[-1]
+    is_mnq = normalized_symbol.startswith(("MNQ", "NQ"))
+    is_btc_test = normalized_symbol.startswith("BTCUSD")
+    if not symbol or len(symbol) > 64 or not (is_mnq or is_btc_test):
+        raise HTTPException(422, "MNQ/NQ or BTCUSD test symbol required")
+    if is_btc_test and str(payload.get("signal", "")) != "connection_test":
+        raise HTTPException(422, "BTCUSD only allowed for connection_test")
     event_id = str(payload.get("event_id") or "")
     if not event_id or len(event_id) > 160:
         raise HTTPException(422, "Unique event_id required")
@@ -71,4 +76,4 @@ async def tradingview(request: Request):
             "signal": str(payload.get("signal", ""))[:80],
             "payload": json.dumps(payload),
         }).scalar_one_or_none()
-    return {"accepted": True, "duplicate": result is None, "execution_enabled": False}
+    return {"accepted": True, "duplicate": result is None, "test_only": is_btc_test, "execution_enabled": False}
