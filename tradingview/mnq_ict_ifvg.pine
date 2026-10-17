@@ -1,0 +1,50 @@
+//@version=6
+indicator("MNQ ICT IFVG Signals", overlay=true)
+strength = input.int(3, "Pivot strength", minval=1)
+window = input.int(12, "Setup lookback bars", minval=1)
+var float hi = na
+var float lo = na
+pHi = ta.pivothigh(high, strength, strength)
+pLo = ta.pivotlow(low, strength, strength)
+if not na(pHi)
+    hi := pHi
+if not na(pLo)
+    lo := pLo
+sweepUp = not na(lo) and low < lo and close > lo
+sweepDown = not na(hi) and high > hi and close < hi
+mssUp = not na(hi) and close > hi and close[1] <= hi
+mssDown = not na(lo) and close < lo and close[1] >= lo
+var int upSetup = na
+var int downSetup = na
+if barstate.isconfirmed
+    if sweepUp or mssUp
+        upSetup := bar_index
+    if sweepDown or mssDown
+        downSetup := bar_index
+var float bearGapTop = na
+var float bullGapBottom = na
+var int bearGapIndex = na
+var int bullGapIndex = na
+invertUp = not na(bearGapTop) and bar_index > bearGapIndex and close > bearGapTop and close[1] <= bearGapTop
+invertDown = not na(bullGapBottom) and bar_index > bullGapIndex and close < bullGapBottom and close[1] >= bullGapBottom
+validSymbol = str.contains(str.upper(syminfo.ticker), "MNQ") or str.contains(str.upper(syminfo.ticker), "NQ")
+validTime = timeframe.isminutes and timeframe.multiplier == 5
+longSignal = barstate.isconfirmed and validSymbol and validTime and invertUp and not na(upSetup) and bar_index - upSetup <= window
+shortSignal = barstate.isconfirmed and validSymbol and validTime and invertDown and not na(downSetup) and bar_index - downSetup <= window
+plotshape(longSignal, "Long", shape.labelup, location.belowbar, color.green, text="LONG")
+plotshape(shortSignal, "Short", shape.labeldown, location.abovebar, color.red, text="SHORT")
+alertcondition(longSignal, "MNQ long signal", "MNQ LONG IFVG")
+alertcondition(shortSignal, "MNQ short signal", "MNQ SHORT IFVG")
+if invertUp
+    bearGapTop := na
+    bearGapIndex := na
+if invertDown
+    bullGapBottom := na
+    bullGapIndex := na
+if barstate.isconfirmed
+    if high < low[2]
+        bearGapTop := low[2]
+        bearGapIndex := bar_index
+    if low > high[2]
+        bullGapBottom := high[2]
+        bullGapIndex := bar_index
