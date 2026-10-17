@@ -1,5 +1,5 @@
 //@version=6
-indicator("MNQ ICT IFVG Signals v4", overlay=true, max_labels_count=500, max_boxes_count=200)
+indicator("MNQ ICT IFVG Signals v5", overlay=true, max_labels_count=500, max_boxes_count=200)
 
 // Signal-only research indicator. No broker orders or risk execution.
 pivotStrength = input.int(3, "Confirmed swing pivot strength", minval=1, maxval=20)
@@ -11,10 +11,14 @@ bodyAtrMult = input.float(0.8, "Displacement body / ATR minimum", minval=0.1, st
 emaLength = input.int(20, "15m bias EMA length", minval=2, maxval=200)
 allowSweep = input.bool(true, "Allow SWEEP + IFVG")
 allowMss = input.bool(true, "Allow MSS + IFVG")
-showStages = input.bool(true, "Show setup and displacement")
-showZones = input.bool(true, "Show IFVG zones")
+displayMode = input.string("Clean", "Display mode", options=["Clean", "Detailed", "Entries Only"])
+showZones = input.bool(true, "Show IFVG zones on confirmed entries")
+detailed = displayMode == "Detailed"
+clean = displayMode == "Clean"
+entriesOnly = displayMode == "Entries Only"
 showBias = input.bool(true, "Show 15m bias")
 
+// Display mode affects chart markers only; signal conditions and alert triggers are unchanged.
 // Last CLOSED 15m candle only, avoiding developing 15m bar repaint.
 htfClose = request.security(syminfo.tickerid, "15", close[1], lookahead=barmerge.lookahead_on)
 htfEma = request.security(syminfo.tickerid, "15", ta.ema(close, emaLength)[1], lookahead=barmerge.lookahead_on)
@@ -102,19 +106,23 @@ longSweep = longSignal and longType == 1
 longMss = longSignal and longType == 2
 shortSweep = shortSignal and shortType == 1
 shortMss = shortSignal and shortType == 2
-plotshape(longSweep, title="SWEEP LONG", style=shape.labelup, location=location.belowbar, color=color.green, text="SWEEP\nLONG", textcolor=color.white, size=size.tiny)
-plotshape(longMss, title="MSS LONG", style=shape.labelup, location=location.belowbar, color=color.teal, text="MSS\nLONG", textcolor=color.white, size=size.tiny)
-plotshape(shortSweep, title="SWEEP SHORT", style=shape.labeldown, location=location.abovebar, color=color.red, text="SWEEP\nSHORT", textcolor=color.white, size=size.tiny)
-plotshape(shortMss, title="MSS SHORT", style=shape.labeldown, location=location.abovebar, color=color.orange, text="MSS\nSHORT", textcolor=color.white, size=size.tiny)
+plotshape(longSweep and not entriesOnly, title="SWEEP LONG", style=shape.labelup, location=location.belowbar, color=color.green, text="SWEEP\nLONG", textcolor=color.white, size=size.tiny)
+plotshape(longMss and not entriesOnly, title="MSS LONG", style=shape.labelup, location=location.belowbar, color=color.teal, text="MSS\nLONG", textcolor=color.white, size=size.tiny)
+plotshape(shortSweep and not entriesOnly, title="SWEEP SHORT", style=shape.labeldown, location=location.abovebar, color=color.red, text="SWEEP\nSHORT", textcolor=color.white, size=size.tiny)
+plotshape(shortMss and not entriesOnly, title="MSS SHORT", style=shape.labeldown, location=location.abovebar, color=color.orange, text="MSS\nSHORT", textcolor=color.white, size=size.tiny)
+// Entries Only uses compact directional markers; alert conditions remain unchanged.
+plotshape(entriesOnly and longSignal, title="LONG ENTRY", style=shape.triangleup, location=location.belowbar, color=color.lime, text="LONG", textcolor=color.white, size=size.small)
+plotshape(entriesOnly and shortSignal, title="SHORT ENTRY", style=shape.triangledown, location=location.abovebar, color=color.red, text="SHORT", textcolor=color.white, size=size.small)
+
 alertcondition(longSweep, "SWEEP LONG", "SWEEP LONG IFVG confirmed")
 alertcondition(longMss, "MSS LONG", "MSS LONG IFVG confirmed")
 alertcondition(shortSweep, "SWEEP SHORT", "SWEEP SHORT IFVG confirmed")
 alertcondition(shortMss, "MSS SHORT", "MSS SHORT IFVG confirmed")
 
 // Draw the inverted gap only on confirmed entries.
-if showZones and longSignal and not na(bearGapBottom)
+if showZones and not entriesOnly and longSignal and not na(bearGapBottom)
     box.new(left=bearGapBar, top=bearGapTop, right=bar_index, bottom=bearGapBottom, border_color=color.green, bgcolor=color.new(color.green, 88))
-if showZones and shortSignal and not na(bullGapTop)
+if showZones and not entriesOnly and shortSignal and not na(bullGapTop)
     box.new(left=bullGapBar, top=bullGapTop, right=bar_index, bottom=bullGapBottom, border_color=color.red, bgcolor=color.new(color.red, 88))
 
 // Consume each confirmed setup once.
@@ -130,12 +138,12 @@ if ready
     if longStage == 1 and bar_index > longSetupBar and bullDisplacement
         longStage := 2
         longDisplaceBar := bar_index
-        if showStages
+        if detailed
             label.new(bar_index, low, "2 DISP UP", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
     if shortStage == 1 and bar_index > shortSetupBar and bearDisplacement
         shortStage := 2
         shortDisplaceBar := bar_index
-        if showStages
+        if detailed
             label.new(bar_index, high, "2 DISP DOWN", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
 
     // Stage 1: arm only while idle; favor SWEEP when both qualify.
@@ -144,26 +152,26 @@ if ready
             longStage := 1
             longSetupBar := bar_index
             longType := 1
-            if showStages
+            if detailed
                 label.new(bar_index, low, "1 SWEEP", color=color.green, textcolor=color.white, size=size.tiny)
         else if allowMss and bullMss
             longStage := 1
             longSetupBar := bar_index
             longType := 2
-            if showStages
+            if detailed
                 label.new(bar_index, low, "1 MSS", color=color.teal, textcolor=color.white, size=size.tiny)
     if shortStage == 0 and not shortSignal and biasShort
         if allowSweep and bearSweep
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 1
-            if showStages
+            if detailed
                 label.new(bar_index, high, "1 SWEEP", color=color.red, textcolor=color.white, size=size.tiny)
         else if allowMss and bearMss
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 2
-            if showStages
+            if detailed
                 label.new(bar_index, high, "1 MSS", color=color.orange, textcolor=color.white, size=size.tiny)
 
 // Each gap can invert once, even if no setup was active.
