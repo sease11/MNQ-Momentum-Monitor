@@ -1,5 +1,5 @@
 //@version=6
-indicator("MNQ ICT IFVG Signals v3", overlay=true, max_labels_count=500)
+indicator("MNQ ICT IFVG Signals v4", overlay=true, max_labels_count=500, max_boxes_count=200)
 
 // Signal-only research indicator. No broker orders or risk execution.
 pivotStrength = input.int(3, "Confirmed swing pivot strength", minval=1, maxval=20)
@@ -11,6 +11,9 @@ bodyAtrMult = input.float(0.8, "Displacement body / ATR minimum", minval=0.1, st
 emaLength = input.int(20, "15m bias EMA length", minval=2, maxval=200)
 allowSweep = input.bool(true, "Allow SWEEP + IFVG")
 allowMss = input.bool(true, "Allow MSS + IFVG")
+showStages = input.bool(true, "Show setup and displacement")
+showZones = input.bool(true, "Show IFVG zones")
+showBias = input.bool(true, "Show 15m bias")
 
 // Last CLOSED 15m candle only, avoiding developing 15m bar repaint.
 htfClose = request.security(syminfo.tickerid, "15", close[1], lookahead=barmerge.lookahead_on)
@@ -49,15 +52,19 @@ var int longType = 0  // 1 SWEEP, 2 MSS
 var int shortType = 0
 
 // Track one newest bearish and bullish three-candle FVG.
+var float bearGapBottom = na
+var float bullGapTop = na
 var float bearGapTop = na
 var int bearGapBar = na
 var float bullGapBottom = na
 var int bullGapBar = na
 if not na(bearGapBar) and bar_index - bearGapBar > gapExpiry
     bearGapTop := na
+    bearGapBottom := na
     bearGapBar := na
 if not na(bullGapBar) and bar_index - bullGapBar > gapExpiry
     bullGapBottom := na
+    bullGapTop := na
     bullGapBar := na
 
 // An IFVG requires a confirmed close THROUGH the opposite FVG boundary.
@@ -104,6 +111,12 @@ alertcondition(longMss, "MSS LONG", "MSS LONG IFVG confirmed")
 alertcondition(shortSweep, "SWEEP SHORT", "SWEEP SHORT IFVG confirmed")
 alertcondition(shortMss, "MSS SHORT", "MSS SHORT IFVG confirmed")
 
+// Draw the inverted gap only on confirmed entries.
+if showZones and longSignal and not na(bearGapBottom)
+    box.new(left=bearGapBar, top=bearGapTop, right=bar_index, bottom=bearGapBottom, border_color=color.green, bgcolor=color.new(color.green, 88))
+if showZones and shortSignal and not na(bullGapTop)
+    box.new(left=bullGapBar, top=bullGapTop, right=bar_index, bottom=bullGapBottom, border_color=color.red, bgcolor=color.new(color.red, 88))
+
 // Consume each confirmed setup once.
 if longSignal
     longStage := 0
@@ -117,9 +130,13 @@ if ready
     if longStage == 1 and bar_index > longSetupBar and bullDisplacement
         longStage := 2
         longDisplaceBar := bar_index
+        if showStages
+            label.new(bar_index, low, "2 DISP UP", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
     if shortStage == 1 and bar_index > shortSetupBar and bearDisplacement
         shortStage := 2
         shortDisplaceBar := bar_index
+        if showStages
+            label.new(bar_index, high, "2 DISP DOWN", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
 
     // Stage 1: arm only while idle; favor SWEEP when both qualify.
     if longStage == 0 and not longSignal and biasLong
@@ -127,33 +144,49 @@ if ready
             longStage := 1
             longSetupBar := bar_index
             longType := 1
+            if showStages
+                label.new(bar_index, low, "1 SWEEP", color=color.green, textcolor=color.white, size=size.tiny)
         else if allowMss and bullMss
             longStage := 1
             longSetupBar := bar_index
             longType := 2
+            if showStages
+                label.new(bar_index, low, "1 MSS", color=color.teal, textcolor=color.white, size=size.tiny)
     if shortStage == 0 and not shortSignal and biasShort
         if allowSweep and bearSweep
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 1
+            if showStages
+                label.new(bar_index, high, "1 SWEEP", color=color.red, textcolor=color.white, size=size.tiny)
         else if allowMss and bearMss
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 2
+            if showStages
+                label.new(bar_index, high, "1 MSS", color=color.orange, textcolor=color.white, size=size.tiny)
 
 // Each gap can invert once, even if no setup was active.
 if invertLong
     bearGapTop := na
+    bearGapBottom := na
     bearGapBar := na
 if invertShort
     bullGapBottom := na
+    bullGapTop := na
     bullGapBar := na
 
 // Form new gaps after checking inversion to avoid same-bar inversion.
 if barstate.isconfirmed and bar_index >= 2
     if high < low[2] and (low[2] - high) >= minFvgTicks * syminfo.mintick
         bearGapTop := low[2]
+        bearGapBottom := high
         bearGapBar := bar_index
     if low > high[2] and (low - high[2]) >= minFvgTicks * syminfo.mintick
         bullGapBottom := high[2]
+        bullGapTop := low
         bullGapBar := bar_index
+
+var table biasPanel = table.new(position.top_right, 1, 1)
+if barstate.islast
+    table.cell(biasPanel, 0, 0, showBias ? (biasLong ? "15m BIAS: LONG" : biasShort ? "15m BIAS: SHORT" : "15m BIAS: NEUTRAL") : "", text_color=color.white, bgcolor=showBias ? (biasLong ? color.green : biasShort ? color.red : color.gray) : color.new(color.black, 100))
