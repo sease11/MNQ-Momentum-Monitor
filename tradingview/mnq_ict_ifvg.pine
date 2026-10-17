@@ -7,13 +7,13 @@ setupExpiry = input.int(8, "Setup expires after N 5m bars", minval=1, maxval=50)
 gapExpiry = input.int(20, "FVG expires after N bars", minval=1, maxval=100)
 minFvgTicks = input.int(8, "Minimum FVG size (ticks)", minval=1, maxval=200)
 bodyAtrMult = input.float(0.8, "Displacement body / ATR minimum", minval=0.1, step=0.1)
-emaLength = input.int(20, "10m bias EMA length", minval=2, maxval=200)
+emaLength = input.int(20, "15m bias EMA length", minval=2, maxval=200)
 allowSweep = input.bool(true, "Allow SWEEP + IFVG")
 allowMss = input.bool(true, "Allow MSS + IFVG")
 
-// Last CLOSED 15m candle only, avoiding developing 10m bar repaint.
-htfClose = request.security(syminfo.tickerid, "10", close[1], lookahead=barmerge.lookahead_on)
-htfEma = request.security(syminfo.tickerid, "10", ta.ema(close, emaLength)[1], lookahead=barmerge.lookahead_on)
+// Last CLOSED 15m candle only, avoiding developing 15m bar repaint.
+htfClose = request.security(syminfo.tickerid, "15", close[1], lookahead=barmerge.lookahead_on)
+htfEma = request.security(syminfo.tickerid, "15", ta.ema(close, emaLength)[1], lookahead=barmerge.lookahead_on)
 biasLong = htfClose > htfEma
 biasShort = htfClose < htfEma
 
