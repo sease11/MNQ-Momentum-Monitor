@@ -14,6 +14,8 @@ def database():
         url = os.environ["DATABASE_URL"]
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):
+            url = "postgresql+psycopg://" + url[len("postgresql://"):]
         engine = create_engine(url, pool_pre_ping=True)
     return engine
 
