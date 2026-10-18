@@ -1,5 +1,5 @@
 //@version=6
-indicator("MNQ ICT IFVG Signals v7", overlay=true, max_labels_count=500, max_boxes_count=200)
+indicator("MNQ ICT IFVG Signals v8", overlay=true, max_labels_count=500, max_boxes_count=200)
 
 // Signal-only research indicator. No broker orders or risk execution.
 pivotStrength = input.int(3, "Confirmed swing pivot strength", minval=1, maxval=20)
@@ -19,6 +19,8 @@ entriesOnly = displayMode == "Entries Only"
 showBias = input.bool(true, "Show 15m bias")
 showDiagnostics = input.bool(true, "Show signal diagnostics")
 showComparison = input.bool(true, "Show no-bias hypothetical entries")
+showMultiComparison = input.bool(true, "Show multi-FVG-only hypothetical entries")
+maxTrackedGaps = input.int(30, "Maximum active FVGs per direction", minval=2, maxval=100)
 panelCorner = input.string("Top Left", "Diagnostics position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"])
 panelSize = input.string("Tiny", "Diagnostics text size", options=["Tiny", "Small", "Normal"])
 diagPosition = panelCorner == "Top Left" ? position.top_left : panelCorner == "Top Right" ? position.top_right : panelCorner == "Bottom Left" ? position.bottom_left : position.bottom_right
@@ -91,6 +93,23 @@ var int shadowLongEntries = 0
 var int shadowShortEntries = 0
 var int shadowOnlyLong = 0
 var int shadowOnlyShort = 0
+
+// Multi-FVG comparison retains separate gap boundaries and formation bars.
+// Strict signal/alert logic below continues to use its original single-gap tracker.
+var array<float> multiBearTops = array.new_float()
+var array<float> multiBearBottoms = array.new_float()
+var array<int> multiBearBars = array.new_int()
+var array<float> multiBullTops = array.new_float()
+var array<float> multiBullBottoms = array.new_float()
+var array<int> multiBullBars = array.new_int()
+var int multiLongEntries = 0
+var int multiShortEntries = 0
+var int multiOnlyLong = 0
+var int multiOnlyShort = 0
+var int multiBearExpired = 0
+var int multiBullExpired = 0
+var int multiBearCapacityDrops = 0
+var int multiBullCapacityDrops = 0
 
 // Track one newest bearish and bullish three-candle FVG.
 var float bearGapBottom = na
@@ -241,6 +260,103 @@ if ready
             if detailed
                 label.new(bar_index, high, "1 MSS", color=color.orange, textcolor=color.white, size=size.tiny)
 
+// Independent multi-gap inversion check: inspect all active gaps before
+// consuming inverted/expired gaps. Oldest eligible gap wins deterministically.
+bool multiInvertLong = false
+bool multiInvertShort = false
+int multiLongGapBar = na
+int multiShortGapBar = na
+float multiLongTop = na
+float multiLongBottom = na
+float multiShortTop = na
+float multiShortBottom = na
+if barstate.isconfirmed
+    if array.size(multiBearBars) > 0
+        for i = array.size(multiBearBars) - 1 to 0
+            int born = array.get(multiBearBars, i)
+            float top = array.get(multiBearTops, i)
+            bool inverted = bar_index > born and close > top and close[1] <= top
+            bool expired = bar_index - born > gapExpiry
+            if inverted and not multiInvertLong and not expired
+                multiInvertLong := true
+                multiLongGapBar := born
+                multiLongTop := top
+                multiLongBottom := array.get(multiBearBottoms, i)
+            if expired
+                multiBearExpired += 1
+            if expired or inverted
+                array.remove(multiBearBars, i)
+                array.remove(multiBearTops, i)
+                array.remove(multiBearBottoms, i)
+    if array.size(multiBullBars) > 0
+        for i = array.size(multiBullBars) - 1 to 0
+            int born = array.get(multiBullBars, i)
+            float bottom = array.get(multiBullBottoms, i)
+            bool inverted = bar_index > born and close < bottom and close[1] >= bottom
+            bool expired = bar_index - born > gapExpiry
+            if inverted and not multiInvertShort and not expired
+                multiInvertShort := true
+                multiShortGapBar := born
+                multiShortTop := array.get(multiBullTops, i)
+                multiShortBottom := bottom
+            if expired
+                multiBullExpired += 1
+            if expired or inverted
+                array.remove(multiBullBars, i)
+                array.remove(multiBullTops, i)
+
+// Separate strict-bias state machine with identical setup and displacement
+// requirements, but multi-gap inversion in place of single-gap inversion.
+var int multiLongStage = 0
+var int multiShortStage = 0
+var int multiLongSetupBar = na
+var int multiShortSetupBar = na
+var int multiLongDispBar = na
+var int multiShortDispBar = na
+if ready
+    if multiLongStage == 1 and bar_index - multiLongSetupBar > displacementWindow
+        multiLongStage := 0
+    if multiShortStage == 1 and bar_index - multiShortSetupBar > displacementWindow
+        multiShortStage := 0
+    if multiLongStage == 2 and bar_index - multiLongDispBar > inversionWindow
+        multiLongStage := 0
+    if multiShortStage == 2 and bar_index - multiShortDispBar > inversionWindow
+        multiShortStage := 0
+    if not biasLong
+        multiLongStage := 0
+    if not biasShort
+        multiShortStage := 0
+
+multiLongSignal = ready and multiLongStage == 2 and bar_index > multiLongDispBar and biasLong and multiInvertLong
+multiShortSignal = ready and multiShortStage == 2 and bar_index > multiShortDispBar and biasShort and multiInvertShort
+multiOnlyLongSignal = multiLongSignal and not longSignal
+multiOnlyShortSignal = multiShortSignal and not shortSignal
+plotshape(showMultiComparison and multiOnlyLongSignal, title="MULTI FVG ONLY LONG (hypothetical)", style=shape.diamond, location=location.belowbar, color=color.blue, size=size.tiny)
+plotshape(showMultiComparison and multiOnlyShortSignal, title="MULTI FVG ONLY SHORT (hypothetical)", style=shape.diamond, location=location.abovebar, color=color.yellow, size=size.tiny)
+if ready
+    if multiLongSignal
+        multiLongEntries += 1
+        multiLongStage := 0
+    if multiShortSignal
+        multiShortEntries += 1
+        multiShortStage := 0
+    if multiOnlyLongSignal
+        multiOnlyLong += 1
+    if multiOnlyShortSignal
+        multiOnlyShort += 1
+    if multiLongStage == 1 and bar_index > multiLongSetupBar and bullDisplacement
+        multiLongStage := 2
+        multiLongDispBar := bar_index
+    if multiShortStage == 1 and bar_index > multiShortSetupBar and bearDisplacement
+        multiShortStage := 2
+        multiShortDispBar := bar_index
+    if multiLongStage == 0 and not multiLongSignal and biasLong and ((allowSweep and bullSweep) or (allowMss and bullMss))
+        multiLongStage := 1
+        multiLongSetupBar := bar_index
+    if multiShortStage == 0 and not multiShortSignal and biasShort and ((allowSweep and bearSweep) or (allowMss and bearMss))
+        multiShortStage := 1
+        multiShortSetupBar := bar_index
+
 // Shadow pipeline runs without the 15m bias; same sweep/MSS, displacement,
 // IFVG, gap storage and expiry windows as strict mode. Never emits alerts.
 if barstate.isconfirmed
@@ -307,6 +423,27 @@ if invertShort
     bullGapTop := na
     bullGapBar := na
 
+// Add each qualifying gap to the independent multi-gap pool, after inversion.
+if ready and bar_index >= 2
+    if high < low[2] and (low[2] - high) >= minFvgTicks * syminfo.mintick
+        array.push(multiBearTops, low[2])
+        array.push(multiBearBottoms, high)
+        array.push(multiBearBars, bar_index)
+        if array.size(multiBearBars) > maxTrackedGaps
+            array.shift(multiBearTops)
+            array.shift(multiBearBottoms)
+            array.shift(multiBearBars)
+            multiBearCapacityDrops += 1
+    if low > high[2] and (low - high[2]) >= minFvgTicks * syminfo.mintick
+        array.push(multiBullTops, low)
+        array.push(multiBullBottoms, high[2])
+        array.push(multiBullBars, bar_index)
+        if array.size(multiBullBars) > maxTrackedGaps
+            array.shift(multiBullTops)
+            array.shift(multiBullBottoms)
+            array.shift(multiBullBars)
+            multiBullCapacityDrops += 1
+
 // Form new gaps after checking inversion to avoid same-bar inversion.
 if barstate.isconfirmed and bar_index >= 2
     if high < low[2] and (low[2] - high) >= minFvgTicks * syminfo.mintick
@@ -327,7 +464,7 @@ if barstate.islast
     table.cell(biasPanel, 0, 0, showBias ? (biasLong ? "15m BIAS: LONG" : biasShort ? "15m BIAS: SHORT" : "15m BIAS: NEUTRAL") : "", text_color=color.white, bgcolor=showBias ? (biasLong ? color.green : biasShort ? color.red : color.gray) : color.new(color.black, 100))
 
 
-var table diagnosticPanel = table.new(diagPosition, 2, 12, border_width=1)
+var table diagnosticPanel = table.new(diagPosition, 2, 16, border_width=1)
 if barstate.islast
     if showDiagnostics
         table.cell(diagnosticPanel, 0, 0, "V7: STRICT / NO BIAS", text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=diagSize)
@@ -338,9 +475,19 @@ if barstate.islast
         table.cell(diagnosticPanel, 1, 2, str.tostring(shadowLongEntries) + " / " + str.tostring(shadowShortEntries), text_color=color.aqua, text_size=diagSize)
         table.cell(diagnosticPanel, 0, 3, "No-bias only L / S", text_color=color.fuchsia, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 3, str.tostring(shadowOnlyLong) + " / " + str.tostring(shadowOnlyShort), text_color=color.fuchsia, text_size=diagSize)
-        table.cell(diagnosticPanel, 0, 4, "Sweep / MSS armed", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 4, "Multi-FVG LONG / SHORT", text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 4, str.tostring(multiLongEntries) + " / " + str.tostring(multiShortEntries), text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 5, "Multi-only LONG / SHORT", text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 5, str.tostring(multiOnlyLong) + " / " + str.tostring(multiOnlyShort), text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 6, "Multi active bear / bull", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 6, str.tostring(array.size(multiBearBars)) + " / " + str.tostring(array.size(multiBullBars)), text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 7, "Multi expired bear / bull", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 7, str.tostring(multiBearExpired) + " / " + str.tostring(multiBullExpired), text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 8, "Capacity drops bear / bull", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 8, str.tostring(multiBearCapacityDrops) + " / " + str.tostring(multiBullCapacityDrops), text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 9, "Sweep / MSS armed", text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 4, str.tostring(detectedSweep) + " / " + str.tostring(detectedMss), text_color=color.white, text_size=diagSize)
-        table.cell(diagnosticPanel, 0, 5, "Displacement", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 15, "Displacement", text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 5, str.tostring(confirmedDisplacement), text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 0, 6, "Bias rejects / invalidates", text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 6, str.tostring(rejectedBias) + " / " + str.tostring(invalidatedBias), text_color=color.white, text_size=diagSize)
@@ -355,4 +502,4 @@ if barstate.islast
         table.cell(diagnosticPanel, 0, 11, "Bull FVG expired", text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 11, str.tostring(bullishGapExpired), text_color=color.white, text_size=diagSize)
     else
-        table.clear(diagnosticPanel, 0, 0, 1, 11)
+        table.clear(diagnosticPanel, 0, 0, 1, 15)
