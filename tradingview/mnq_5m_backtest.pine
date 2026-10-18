@@ -1,0 +1,927 @@
+// Derivative incorporating adapted LuxAlgo OB detection. CC BY-NC-SA 4.0.
+// Attribution and modifications are documented in the Breaker detector section.
+//@version=6
+strategy("MNQ 5m IFVG vs Breakers Backtest v1", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=200, max_bars_back=2500, initial_capital=100000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, pyramiding=0, commission_type=strategy.commission.cash_per_contract, commission_value=0.75, slippage=1, margin_long=10, margin_short=10, calc_on_order_fills=true, calc_on_every_tick=false, process_orders_on_close=false, use_bar_magnifier=false)
+// BACKTEST ONLY: simulated orders; no broker integration or execution alerts.
+// Skip signal/state evaluation during broker-emulator fill recalculations.
+// This prevents historical entry/exit fills from using that bar's future OHLC.
+varip float btPreviousPosition = 0.0
+varip int btPreviousClosed = 0
+btFillPass = strategy.position_size != btPreviousPosition or strategy.closedtrades != btPreviousClosed
+btPreviousPosition := strategy.position_size
+btPreviousClosed := strategy.closedtrades
+btSignalPass = barstate.isconfirmed and not btFillPass
+btFamily = input.string("IFVG", "Test entry family", options=["IFVG", "Breakers"], group="Backtest")
+btRR = input.float(2.0, "Target / initial risk", minval=0.25, step=0.25, group="Backtest")
+btBuffer = input.int(1, "Stop buffer beyond zone (ticks)", minval=1, group="Backtest")
+btStart = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Start (UTC)", group="Backtest")
+btEnd = input.time(timestamp("19 Oct 2026 00:00 +0000"), "End (UTC)", group="Backtest")
+btInvalidate = input.bool(true, "Exit on zone / required direction invalidation", group="Backtest")
+
+
+
+// Research strategy: simulated historical orders only; all strategy alerts disabled.
+// Original 5m/15m-bias pipeline plus independent structure/size confirmation.
+// Turn both Entry confirmation filters OFF for baseline strict entry behavior.
+// No-bias and multi-FVG comparisons apply the same added confirmation filters.
+pivotStrength = input.int(3, "Confirmed swing pivot strength", minval=1, maxval=20)
+displacementWindow = input.int(6, "Setup to displacement: max bars", minval=1, maxval=50)
+inversionWindow = input.int(8, "Displacement to IFVG: max bars", minval=1, maxval=50)
+gapExpiry = input.int(20, "FVG expires after N bars", minval=1, maxval=100)
+minFvgTicks = input.int(8, "Minimum FVG size (ticks)", minval=1, maxval=200)
+bodyAtrMult = input.float(0.8, "Displacement body / ATR minimum", minval=0.1, step=0.1)
+emaLength = input.int(20, "15m bias EMA length", minval=2, maxval=200)
+allowSweep = input.bool(true, "Allow SWEEP + IFVG")
+allowMss = input.bool(true, "Allow MSS + IFVG")
+displayMode = input.string("Clean", "Display mode", options=["Clean", "Detailed", "Entries Only"])
+showZones = input.bool(true, "Show IFVG zones on confirmed entries")
+detailed = displayMode == "Detailed"
+clean = displayMode == "Clean"
+entriesOnly = displayMode == "Entries Only"
+showBias = input.bool(true, "Show 15m bias")
+showDiagnostics = input.bool(true, "Show signal diagnostics")
+panelDetail = input.string("Compact", "Diagnostics layout", options=["Compact", "Full"])
+showComparison = input.bool(true, "Show no-bias hypothetical entries")
+showMultiComparison = input.bool(true, "Show multi-FVG-only hypothetical entries")
+maxTrackedGaps = input.int(30, "Maximum active FVGs per direction", minval=2, maxval=100)
+panelCorner = input.string("Top Left", "Diagnostics position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"])
+panelSize = input.string("Tiny", "Diagnostics text size", options=["Tiny", "Small", "Normal"])
+diagPosition = panelCorner == "Top Left" ? position.top_left : panelCorner == "Top Right" ? position.top_right : panelCorner == "Bottom Left" ? position.bottom_left : position.bottom_right
+diagSize = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
+
+// Display mode affects chart markers only; signal conditions and alert triggers are unchanged.
+// Last CLOSED 15m candle only, avoiding developing 15m bar repaint.
+htfClose = request.security(syminfo.tickerid, "15", close[1], lookahead=barmerge.lookahead_on)
+htfEma = request.security(syminfo.tickerid, "15", ta.ema(close, emaLength)[1], lookahead=barmerge.lookahead_on)
+biasLong = htfClose > htfEma
+biasShort = htfClose < htfEma
+
+ph = ta.pivothigh(high, pivotStrength, pivotStrength)
+pl = ta.pivotlow(low, pivotStrength, pivotStrength)
+var float lastHigh = na
+var float lastLow = na
+if btSignalPass and not na(ph)
+    lastHigh := ph
+if btSignalPass and not na(pl)
+    lastLow := pl
+
+atr = ta.atr(14)
+body = math.abs(close - open)
+bullDisplacement = close > open and body >= atr * bodyAtrMult
+bearDisplacement = close < open and body >= atr * bodyAtrMult
+
+bullSweep = not na(lastLow) and low < lastLow and close > lastLow
+bearSweep = not na(lastHigh) and high > lastHigh and close < lastHigh
+// Simplified MSS proxy: close crosses a confirmed pivot with displacement.
+bullMss = not na(lastHigh) and close > lastHigh and close[1] <= lastHigh
+bearMss = not na(lastLow) and close < lastLow and close[1] >= lastLow
+
+// Independent three-stage state machines: 0 idle, 1 setup, 2 displacement.
+var int longStage = 0
+var int shortStage = 0
+var int longSetupBar = na
+var int shortSetupBar = na
+var int longDisplaceBar = na
+var int shortDisplaceBar = na
+var int longType = 0  // 1 SWEEP, 2 MSS
+var int shortType = 0
+
+// Cumulative counts over loaded chart history; a candidate is counted when idle.
+var int detectedSweep = 0
+var int detectedMss = 0
+var int confirmedDisplacement = 0
+var int rejectedBias = 0
+var int expiredBeforeDisplacement = 0
+var int expiredBeforeIfvg = 0
+var int invalidatedBias = 0
+var int confirmedEntries = 0
+var int confirmedLongs = 0
+var int confirmedShorts = 0
+
+var int bearishGapReplaced = 0
+var int bullishGapReplaced = 0
+var int bearishGapExpired = 0
+var int bullishGapExpired = 0
+
+// No-bias shadow state machine; strictly diagnostic, never used in alerts.
+var int shadowLongStage = 0
+var int shadowShortStage = 0
+var int shadowLongType = 0
+var int shadowShortType = 0
+var int shadowLongSetupBar = na
+var int shadowShortSetupBar = na
+var int shadowLongDispBar = na
+var int shadowShortDispBar = na
+var int shadowLongEntries = 0
+var int shadowShortEntries = 0
+var int shadowOnlyLong = 0
+var int shadowOnlyShort = 0
+
+// Multi-FVG comparison retains separate gap boundaries and formation bars.
+// Strict signal/alert logic below continues to use its original single-gap tracker.
+var array<float> multiBearTops = array.new_float()
+var array<float> multiBearBottoms = array.new_float()
+var array<int> multiBearBars = array.new_int()
+var array<float> multiBullTops = array.new_float()
+var array<float> multiBullBottoms = array.new_float()
+var array<int> multiBullBars = array.new_int()
+var int multiLongEntries = 0
+var int multiShortEntries = 0
+var int multiOnlyLong = 0
+var int multiOnlyShort = 0
+var int multiBearExpired = 0
+var int multiBullExpired = 0
+var int multiBearCapacityDrops = 0
+var int strictOnlyLong = 0
+var int strictOnlyShort = 0
+var int multiBullCapacityDrops = 0
+
+// Track one newest bearish and bullish three-candle FVG.
+var float bearGapBottom = na
+var float bullGapTop = na
+var float bearGapTop = na
+var int bearGapBar = na
+var float bullGapBottom = na
+var int bullGapBar = na
+if btSignalPass and not na(bearGapBar) and bar_index - bearGapBar > gapExpiry
+    bearishGapExpired += 1
+    bearGapTop := na
+    bearGapBottom := na
+    bearGapBar := na
+if btSignalPass and not na(bullGapBar) and bar_index - bullGapBar > gapExpiry
+    bullishGapExpired += 1
+    bullGapBottom := na
+    bullGapTop := na
+    bullGapBar := na
+
+// An IFVG requires a confirmed close THROUGH the opposite FVG boundary.
+invertLong = btSignalPass and not na(bearGapTop) and bar_index > bearGapBar and close > bearGapTop and close[1] <= bearGapTop
+invertShort = btSignalPass and not na(bullGapBottom) and bar_index > bullGapBar and close < bullGapBottom and close[1] >= bullGapBottom
+
+validSymbol = str.contains(str.upper(syminfo.ticker), "MNQ") or str.contains(str.upper(syminfo.ticker), "NQ")
+validTime = timeframe.isminutes and timeframe.multiplier == 5
+ready = btSignalPass and validSymbol and validTime
+
+// Independently implemented structure/FVG module, inspired by Fusion's visible
+// feature set. No protected Fusion source was accessed or copied.
+// Visual structure uses confirmed symmetric pivots. First break is BOS;
+// a break opposite the previous break direction is MSS. Lines originate at
+// the pivot but only become known and are drawn on the confirmed break bar.
+fxShowStructure = input.bool(true, "Show MSS / BOS lines", group="Structure + FVG")
+fxPivot = input.int(5, "Structure pivot strength", minval=1, maxval=20, group="Structure + FVG")
+fxCount = input.int(20, "Retain structure breaks", minval=1, maxval=60, group="Structure + FVG")
+fxBull = input.color(color.teal, "Bullish color", group="Structure + FVG")
+fxBear = input.color(color.orange, "Bearish color", group="Structure + FVG")
+fxShowFvg = input.bool(true, "Show traditional FVGs", group="Structure + FVG")
+fxShowIfvg = input.bool(true, "Show visual inversion zones", group="Structure + FVG")
+fxGapCount = input.int(20, "Maximum visual zones (total)", minval=1, maxval=60, group="Structure + FVG")
+fxExtend = input.string("Fixed", "Zone extension", options=["Fixed", "Current bar"], group="Structure + FVG")
+fxLength = input.int(5, "Fixed extension bars", minval=1, maxval=100, group="Structure + FVG")
+fxDeleteClose = input.bool(true, "Remove zones after close through far edge", group="Structure + FVG")
+fxDeleteWick = input.bool(false, "Remove zones after wick through far edge", group="Structure + FVG")
+fxFilterStructure = input.bool(true, "Entries require structure direction", group="Entry confirmation")
+fxFilterSize = input.bool(true, "Entries require minimum IFVG / ATR", group="Entry confirmation")
+fxAtrMin = input.float(0.25, "Minimum IFVG width / ATR(14)", minval=0.0, step=0.05, group="Entry confirmation")
+// Entry size uses ATR on the inversion bar, not a hidden formation-bar value.
+// Visual inversion zones are context only; their optional display/cleanup does
+// not replace the existing single-gap entry engine or emit extra alerts.
+fxPh = ta.pivothigh(high, fxPivot, fxPivot)
+fxPl = ta.pivotlow(low, fxPivot, fxPivot)
+var float fxHigh = na
+var float fxLow = na
+var int fxHighBar = na
+var int fxLowBar = na
+var bool fxHighBroken = false
+var bool fxLowBroken = false
+var int fxDirection = 0
+var array<line> fxLines = array.new<line>()
+var array<label> fxLabels = array.new<label>()
+if ready
+    if not na(fxPh)
+        fxHigh := fxPh
+        fxHighBar := bar_index - fxPivot
+        fxHighBroken := false
+    if not na(fxPl)
+        fxLow := fxPl
+        fxLowBar := bar_index - fxPivot
+        fxLowBroken := false
+    bool upBreak = not fxHighBroken and not na(fxHigh) and close > fxHigh
+    bool downBreak = not fxLowBroken and not na(fxLow) and close < fxLow
+    if upBreak or downBreak
+        int direction = upBreak ? 1 : -1
+        float level = upBreak ? fxHigh : fxLow
+        int origin = upBreak ? fxHighBar : fxLowBar
+        color ink = upBreak ? fxBull : fxBear
+        string tag = fxDirection != 0 and fxDirection != direction ? "MSS" : "BOS"
+        fxDirection := direction
+        if upBreak
+            fxHighBroken := true
+        else
+            fxLowBroken := true
+        if fxShowStructure
+            array.push(fxLines, line.new(origin, level, bar_index, level, color=ink))
+            array.push(fxLabels, label.new(bar_index, level, tag, style=upBreak ? label.style_label_down : label.style_label_up, color=color.new(ink, 80), textcolor=ink, size=size.tiny))
+            if array.size(fxLines) > fxCount
+                line.delete(array.shift(fxLines))
+                label.delete(array.shift(fxLabels))
+
+fxLongStructure = not fxFilterStructure or fxDirection == 1
+fxShortStructure = not fxFilterStructure or fxDirection == -1
+fxLongSize = not fxFilterSize or (not na(bearGapTop) and bearGapTop - bearGapBottom >= atr * fxAtrMin)
+fxShortSize = not fxFilterSize or (not na(bullGapTop) and bullGapTop - bullGapBottom >= atr * fxAtrMin)
+
+type FxZone
+    box area
+    line middle
+    float top
+    float bottom
+    int direction
+    int born
+    bool inverted
+
+fxErase(FxZone z) =>
+    box.delete(z.area)
+    line.delete(z.middle)
+
+var array<FxZone> fxZones = array.new<FxZone>()
+if ready
+    if array.size(fxZones) > 0
+        for i = array.size(fxZones) - 1 to 0
+            FxZone z = array.get(fxZones, i)
+            bool throughClose = z.direction == 1 ? close < z.bottom : close > z.top
+            bool throughWick = z.direction == 1 ? low < z.bottom : high > z.top
+            bool removeZone = false
+            if bar_index > z.born
+                if not z.inverted and throughClose and fxShowIfvg
+                    z.direction := -z.direction
+                    z.inverted := true
+                    z.born := bar_index
+                    color ink = z.direction == 1 ? fxBull : fxBear
+                    box.set_bgcolor(z.area, color.new(ink, 88))
+                    box.set_border_color(z.area, ink)
+                    box.set_text(z.area, "IFVG context")
+                    box.set_text_color(z.area, ink)
+                    line.set_color(z.middle, ink)
+                    line.set_style(z.middle, line.style_dotted)
+                    if fxExtend == "Fixed"
+                        box.set_right(z.area, bar_index + fxLength)
+                        line.set_x2(z.middle, bar_index + fxLength)
+                else
+                    removeZone := (fxDeleteClose and throughClose) or (fxDeleteWick and throughWick)
+            if fxExtend == "Current bar"
+                box.set_right(z.area, bar_index)
+                line.set_x2(z.middle, bar_index)
+            if removeZone or bar_index - box.get_left(z.area) > 2000
+                fxErase(z)
+                array.remove(fxZones, i)
+    bool newBull = bar_index >= 2 and low > high[2] and low - high[2] >= minFvgTicks * syminfo.mintick
+    bool newBear = bar_index >= 2 and high < low[2] and low[2] - high >= minFvgTicks * syminfo.mintick
+    if (fxShowFvg or fxShowIfvg) and (newBull or newBear)
+        float top = newBull ? low : low[2]
+        float bottom = newBull ? high[2] : high
+        color ink = newBull ? fxBull : fxBear
+        int rightEdge = fxExtend == "Fixed" ? bar_index + fxLength : bar_index
+        int opacity = fxShowFvg ? 88 : 100
+        box area = box.new(bar_index - 2, top, rightEdge, bottom, border_color=color.new(ink, fxShowFvg ? 25 : 100), bgcolor=color.new(ink, opacity), text=fxShowFvg ? "FVG" : "", text_color=ink, text_size=size.tiny)
+        line middle = line.new(bar_index - 2, (top + bottom) / 2, rightEdge, (top + bottom) / 2, color=color.new(ink, fxShowFvg ? 35 : 100), style=line.style_dotted)
+        array.push(fxZones, FxZone.new(area, middle, top, bottom, newBull ? 1 : -1, bar_index, false))
+        if array.size(fxZones) > fxGapCount
+            fxErase(array.shift(fxZones))
+// End structure/FVG module.
+
+// Expire pending stages and invalidate when 15m bias flips.
+if btSignalPass
+    if longStage == 1 and bar_index - longSetupBar > displacementWindow
+        expiredBeforeDisplacement += 1
+        longStage := 0
+        longType := 0
+    if shortStage == 1 and bar_index - shortSetupBar > displacementWindow
+        expiredBeforeDisplacement += 1
+        shortStage := 0
+        shortType := 0
+    if longStage == 2 and bar_index - longDisplaceBar > inversionWindow
+        expiredBeforeIfvg += 1
+        longStage := 0
+        longType := 0
+    if shortStage == 2 and bar_index - shortDisplaceBar > inversionWindow
+        expiredBeforeIfvg += 1
+        shortStage := 0
+        shortType := 0
+    if not biasLong
+        if longStage != 0
+            invalidatedBias += 1
+        longStage := 0
+        longType := 0
+    if not biasShort
+        if shortStage != 0
+            invalidatedBias += 1
+        shortStage := 0
+        shortType := 0
+
+// Confirm only after a later displacement candle; no same-bar shortcuts.
+longSignal = ready and longStage == 2 and bar_index > longDisplaceBar and invertLong and biasLong and fxLongStructure and fxLongSize
+shortSignal = ready and shortStage == 2 and bar_index > shortDisplaceBar and invertShort and biasShort and fxShortStructure and fxShortSize
+btIfvgLongTop = bearGapTop
+btIfvgLongBottom = bearGapBottom
+btIfvgShortTop = bullGapTop
+btIfvgShortBottom = bullGapBottom
+longSweep = longSignal and longType == 1
+longMss = longSignal and longType == 2
+shortSweep = shortSignal and shortType == 1
+shortMss = shortSignal and shortType == 2
+plotshape(longSweep and not entriesOnly, title="SWEEP LONG", style=shape.labelup, location=location.belowbar, color=color.green, text="SWEEP\nLONG", textcolor=color.white, size=size.tiny)
+plotshape(longMss and not entriesOnly, title="MSS LONG", style=shape.labelup, location=location.belowbar, color=color.teal, text="MSS\nLONG", textcolor=color.white, size=size.tiny)
+plotshape(shortSweep and not entriesOnly, title="SWEEP SHORT", style=shape.labeldown, location=location.abovebar, color=color.red, text="SWEEP\nSHORT", textcolor=color.white, size=size.tiny)
+plotshape(shortMss and not entriesOnly, title="MSS SHORT", style=shape.labeldown, location=location.abovebar, color=color.orange, text="MSS\nSHORT", textcolor=color.white, size=size.tiny)
+// Entries Only uses compact directional markers; alert conditions remain unchanged.
+plotshape(entriesOnly and longSignal, title="LONG ENTRY", style=shape.triangleup, location=location.belowbar, color=color.lime, text="LONG", textcolor=color.white, size=size.small)
+plotshape(entriesOnly and shortSignal, title="SHORT ENTRY", style=shape.triangledown, location=location.abovebar, color=color.red, text="SHORT", textcolor=color.white, size=size.small)
+
+
+// Draw the inverted gap only on confirmed entries.
+if showZones and not entriesOnly and longSignal and not na(bearGapBottom)
+    box.new(left=bearGapBar, top=bearGapTop, right=bar_index, bottom=bearGapBottom, border_color=color.green, bgcolor=color.new(color.green, 88))
+if showZones and not entriesOnly and shortSignal and not na(bullGapTop)
+    box.new(left=bullGapBar, top=bullGapTop, right=bar_index, bottom=bullGapBottom, border_color=color.red, bgcolor=color.new(color.red, 88))
+
+// Count completed signals without modifying eligibility.
+if longSignal
+    confirmedEntries += 1
+    confirmedLongs += 1
+if shortSignal
+    confirmedEntries += 1
+    confirmedShorts += 1
+
+// Freeze strict eligibility before setup consumption and stage transitions.
+// A multi-FVG comparison must share this exact eligibility snapshot.
+strictLongEligible = ready and longStage == 2 and bar_index > longDisplaceBar and biasLong and fxLongStructure
+strictShortEligible = ready and shortStage == 2 and bar_index > shortDisplaceBar and biasShort and fxShortStructure
+
+// Consume each confirmed setup once.
+if longSignal
+    longStage := 0
+    longType := 0
+if shortSignal
+    shortStage := 0
+    shortType := 0
+
+// Stage 2 requires displacement on a later bar than the initial setup.
+if ready
+    if longStage == 1 and bar_index > longSetupBar and bullDisplacement
+        longStage := 2
+        confirmedDisplacement += 1
+        longDisplaceBar := bar_index
+        if detailed
+            label.new(bar_index, low, "2 DISP UP", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+    if shortStage == 1 and bar_index > shortSetupBar and bearDisplacement
+        shortStage := 2
+        confirmedDisplacement += 1
+        shortDisplaceBar := bar_index
+        if detailed
+            label.new(bar_index, high, "2 DISP DOWN", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+    // Count only otherwise eligible idle setup candidates blocked by HTF bias.
+    if longStage == 0 and not longSignal and not biasLong and ((allowSweep and bullSweep) or (allowMss and bullMss))
+        rejectedBias += 1
+    if shortStage == 0 and not shortSignal and not biasShort and ((allowSweep and bearSweep) or (allowMss and bearMss))
+        rejectedBias += 1
+
+    // Stage 1: arm only while idle; favor SWEEP when both qualify.
+    if longStage == 0 and not longSignal and biasLong
+        if allowSweep and bullSweep
+            longStage := 1
+            longSetupBar := bar_index
+            longType := 1
+            detectedSweep += 1
+            if detailed
+                label.new(bar_index, low, "1 SWEEP", color=color.green, textcolor=color.white, size=size.tiny)
+        else if allowMss and bullMss
+            longStage := 1
+            longSetupBar := bar_index
+            longType := 2
+            detectedMss += 1
+            if detailed
+                label.new(bar_index, low, "1 MSS", color=color.teal, textcolor=color.white, size=size.tiny)
+    if shortStage == 0 and not shortSignal and biasShort
+        if allowSweep and bearSweep
+            shortStage := 1
+            shortSetupBar := bar_index
+            shortType := 1
+            detectedSweep += 1
+            if detailed
+                label.new(bar_index, high, "1 SWEEP", color=color.red, textcolor=color.white, size=size.tiny)
+        else if allowMss and bearMss
+            shortStage := 1
+            shortSetupBar := bar_index
+            shortType := 2
+            detectedMss += 1
+            if detailed
+                label.new(bar_index, high, "1 MSS", color=color.orange, textcolor=color.white, size=size.tiny)
+
+// Independent multi-gap inversion check: inspect all active gaps before
+// consuming inverted/expired gaps. Newest eligible gap wins deterministically.
+bool multiInvertLong = false
+bool multiInvertShort = false
+int multiLongGapBar = na
+int multiShortGapBar = na
+float multiLongTop = na
+float multiLongBottom = na
+float multiShortTop = na
+float multiShortBottom = na
+if btSignalPass
+    if array.size(multiBearBars) > 0
+        for i = array.size(multiBearBars) - 1 to 0
+            int born = array.get(multiBearBars, i)
+            float top = array.get(multiBearTops, i)
+            bool inverted = bar_index > born and close > top and close[1] <= top
+            bool expired = bar_index - born > gapExpiry
+            if inverted and not multiInvertLong and not expired
+                multiInvertLong := true
+                multiLongGapBar := born
+                multiLongTop := top
+                multiLongBottom := array.get(multiBearBottoms, i)
+            if expired
+                multiBearExpired += 1
+            if expired or inverted
+                array.remove(multiBearBars, i)
+                array.remove(multiBearTops, i)
+                array.remove(multiBearBottoms, i)
+    if array.size(multiBullBars) > 0
+        for i = array.size(multiBullBars) - 1 to 0
+            int born = array.get(multiBullBars, i)
+            float bottom = array.get(multiBullBottoms, i)
+            bool inverted = bar_index > born and close < bottom and close[1] >= bottom
+            bool expired = bar_index - born > gapExpiry
+            if inverted and not multiInvertShort and not expired
+                multiInvertShort := true
+                multiShortGapBar := born
+                multiShortTop := array.get(multiBullTops, i)
+                multiShortBottom := bottom
+            if expired
+                multiBullExpired += 1
+            if expired or inverted
+                array.remove(multiBullBars, i)
+                array.remove(multiBullTops, i)
+                array.remove(multiBullBottoms, i)
+
+// Compare the same strict stage and bar against a multi-gap inversion.
+// Both comparisons use the strict setup/displacement stage snapshot from
+// BEFORE the strict engine consumes the current candle's signal.
+multiLongSignal = ready and strictLongEligible and multiInvertLong and (not fxFilterSize or multiLongTop - multiLongBottom >= atr * fxAtrMin)
+multiShortSignal = ready and strictShortEligible and multiInvertShort and (not fxFilterSize or multiShortTop - multiShortBottom >= atr * fxAtrMin)
+multiOnlyLongSignal = multiLongSignal and not longSignal
+multiOnlyShortSignal = multiShortSignal and not shortSignal
+strictOnlyLongSignal = longSignal and not multiLongSignal
+strictOnlyShortSignal = shortSignal and not multiShortSignal
+plotshape(showMultiComparison and multiOnlyLongSignal, title="MULTI FVG ONLY LONG (hypothetical)", style=shape.diamond, location=location.belowbar, color=color.blue, size=size.tiny)
+plotshape(showMultiComparison and multiOnlyShortSignal, title="MULTI FVG ONLY SHORT (hypothetical)", style=shape.diamond, location=location.abovebar, color=color.yellow, size=size.tiny)
+if ready
+    if multiLongSignal
+        multiLongEntries += 1
+    if multiShortSignal
+        multiShortEntries += 1
+    if multiOnlyLongSignal
+        multiOnlyLong += 1
+    if multiOnlyShortSignal
+        multiOnlyShort += 1
+    if strictOnlyLongSignal
+        strictOnlyLong += 1
+    if strictOnlyShortSignal
+        strictOnlyShort += 1
+
+// Shadow pipeline runs without the 15m bias; same sweep/MSS, displacement,
+// IFVG, gap storage and expiry windows as strict mode. Never emits alerts.
+if btSignalPass
+    if shadowLongStage == 1 and bar_index - shadowLongSetupBar > displacementWindow
+        shadowLongStage := 0
+    if shadowShortStage == 1 and bar_index - shadowShortSetupBar > displacementWindow
+        shadowShortStage := 0
+    if shadowLongStage == 2 and bar_index - shadowLongDispBar > inversionWindow
+        shadowLongStage := 0
+    if shadowShortStage == 2 and bar_index - shadowShortDispBar > inversionWindow
+        shadowShortStage := 0
+
+shadowLongSignal = ready and shadowLongStage == 2 and bar_index > shadowLongDispBar and invertLong and fxLongStructure and fxLongSize
+shadowShortSignal = ready and shadowShortStage == 2 and bar_index > shadowShortDispBar and invertShort and fxShortStructure and fxShortSize
+shadowOnlyLongSignal = shadowLongSignal and not longSignal
+shadowOnlyShortSignal = shadowShortSignal and not shortSignal
+
+plotshape(showComparison and shadowOnlyLongSignal, title="NO BIAS LONG (hypothetical)", style=shape.circle, location=location.belowbar, color=color.aqua, size=size.tiny)
+plotshape(showComparison and shadowOnlyShortSignal, title="NO BIAS SHORT (hypothetical)", style=shape.circle, location=location.abovebar, color=color.fuchsia, size=size.tiny)
+
+if ready
+    if shadowLongSignal
+        shadowLongEntries += 1
+        shadowLongStage := 0
+    if shadowShortSignal
+        shadowShortEntries += 1
+        shadowShortStage := 0
+    if shadowOnlyLongSignal
+        shadowOnlyLong += 1
+    if shadowOnlyShortSignal
+        shadowOnlyShort += 1
+    if shadowLongStage == 1 and bar_index > shadowLongSetupBar and bullDisplacement
+        shadowLongStage := 2
+        shadowLongDispBar := bar_index
+    if shadowShortStage == 1 and bar_index > shadowShortSetupBar and bearDisplacement
+        shadowShortStage := 2
+        shadowShortDispBar := bar_index
+    if shadowLongStage == 0 and not shadowLongSignal
+        if allowSweep and bullSweep
+            shadowLongStage := 1
+            shadowLongSetupBar := bar_index
+            shadowLongType := 1
+        else if allowMss and bullMss
+            shadowLongStage := 1
+            shadowLongSetupBar := bar_index
+            shadowLongType := 2
+    if shadowShortStage == 0 and not shadowShortSignal
+        if allowSweep and bearSweep
+            shadowShortStage := 1
+            shadowShortSetupBar := bar_index
+            shadowShortType := 1
+        else if allowMss and bearMss
+            shadowShortStage := 1
+            shadowShortSetupBar := bar_index
+            shadowShortType := 2
+
+// Each gap can invert once, even if no setup was active.
+if invertLong
+    bearGapTop := na
+    bearGapBottom := na
+    bearGapBar := na
+if invertShort
+    bullGapBottom := na
+    bullGapTop := na
+    bullGapBar := na
+
+// Add each qualifying gap to the independent multi-gap pool, after inversion.
+if ready and bar_index >= 2
+    if high < low[2] and (low[2] - high) >= minFvgTicks * syminfo.mintick
+        array.push(multiBearTops, low[2])
+        array.push(multiBearBottoms, high)
+        array.push(multiBearBars, bar_index)
+        if array.size(multiBearBars) > maxTrackedGaps
+            array.shift(multiBearTops)
+            array.shift(multiBearBottoms)
+            array.shift(multiBearBars)
+            multiBearCapacityDrops += 1
+    if low > high[2] and (low - high[2]) >= minFvgTicks * syminfo.mintick
+        array.push(multiBullTops, low)
+        array.push(multiBullBottoms, high[2])
+        array.push(multiBullBars, bar_index)
+        if array.size(multiBullBars) > maxTrackedGaps
+            array.shift(multiBullTops)
+            array.shift(multiBullBottoms)
+            array.shift(multiBullBars)
+            multiBullCapacityDrops += 1
+
+// Form new gaps after checking inversion to avoid same-bar inversion.
+if btSignalPass and bar_index >= 2
+    if high < low[2] and (low[2] - high) >= minFvgTicks * syminfo.mintick
+        if not na(bearGapBar)
+            bearishGapReplaced += 1
+        bearGapTop := low[2]
+        bearGapBottom := high
+        bearGapBar := bar_index
+    if low > high[2] and (low - high[2]) >= minFvgTicks * syminfo.mintick
+        if not na(bullGapBar)
+            bullishGapReplaced += 1
+        bullGapBottom := high[2]
+        bullGapTop := low
+        bullGapBar := bar_index
+
+var table biasPanel = table.new(position.top_right, 1, 1)
+if barstate.islast
+    table.cell(biasPanel, 0, 0, showBias ? (biasLong ? "15m BIAS: LONG" : biasShort ? "15m BIAS: SHORT" : "15m BIAS: NEUTRAL") : "", text_color=color.white, bgcolor=showBias ? (biasLong ? color.green : biasShort ? color.red : color.gray) : color.new(color.black, 100))
+
+
+var table diagnosticPanel = table.new(diagPosition, 2, 18, border_width=1)
+if barstate.islast
+    if showDiagnostics
+        table.clear(diagnosticPanel, 0, 0, 1, 17)
+        table.cell(diagnosticPanel, 0, 0, "5m FUSION AUDIT", text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 0, "COUNT", text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 1, "Strict LONG / SHORT", text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 1, str.tostring(confirmedLongs) + " / " + str.tostring(confirmedShorts), text_color=color.white, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 2, "No-bias LONG / SHORT", text_color=color.aqua, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 2, str.tostring(shadowLongEntries) + " / " + str.tostring(shadowShortEntries), text_color=color.aqua, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 3, "No-bias only L / S", text_color=color.fuchsia, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 3, str.tostring(shadowOnlyLong) + " / " + str.tostring(shadowOnlyShort), text_color=color.fuchsia, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 4, "Multi-FVG LONG / SHORT", text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 4, str.tostring(multiLongEntries) + " / " + str.tostring(multiShortEntries), text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 5, "Multi-only LONG / SHORT", text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 5, str.tostring(multiOnlyLong) + " / " + str.tostring(multiOnlyShort), text_color=color.yellow, text_size=diagSize)
+        table.cell(diagnosticPanel, 0, 6, "Strict-only L / S", text_color=color.orange, text_size=diagSize)
+        table.cell(diagnosticPanel, 1, 6, str.tostring(strictOnlyLong) + " / " + str.tostring(strictOnlyShort), text_color=color.orange, text_size=diagSize)
+        if panelDetail == "Full"
+            table.cell(diagnosticPanel, 0, 7, "Multi active bear / bull", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 7, str.tostring(array.size(multiBearBars)) + " / " + str.tostring(array.size(multiBullBars)), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 8, "Multi expired bear / bull", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 8, str.tostring(multiBearExpired) + " / " + str.tostring(multiBullExpired), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 9, "Capacity drops bear / bull", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 9, str.tostring(multiBearCapacityDrops) + " / " + str.tostring(multiBullCapacityDrops), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 10, "Sweep / MSS armed", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 10, str.tostring(detectedSweep) + " / " + str.tostring(detectedMss), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 11, "Displacement", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 11, str.tostring(confirmedDisplacement), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 12, "Bias rejects / invalidates", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 12, str.tostring(rejectedBias) + " / " + str.tostring(invalidatedBias), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 13, "Setup / IFVG expired", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 13, str.tostring(expiredBeforeDisplacement) + " / " + str.tostring(expiredBeforeIfvg), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 14, "Bear FVG replaced", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 14, str.tostring(bearishGapReplaced), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 15, "Bull FVG replaced", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 15, str.tostring(bullishGapReplaced), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 16, "Bear FVG expired", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 16, str.tostring(bearishGapExpired), text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 0, 17, "Bull FVG expired", text_color=color.white, text_size=diagSize)
+            table.cell(diagnosticPanel, 1, 17, str.tostring(bullishGapExpired), text_color=color.white, text_size=diagSize)
+    else
+        table.clear(diagnosticPanel, 0, 0, 1, 17)
+
+
+// Breaker detector adapted from Order Blocks & Breaker Blocks [LuxAlgo].
+// © LuxAlgo; original: https://www.tradingview.com/script/piIbWMpY-Order-Blocks-Breaker-Blocks-LuxAlgo/
+// CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
+// Modifications: Pine v6, confirmed closes, bounded storage/scan, own drawings,
+// forward-only entries, optional HTF/structure filters, expiry and diagnostics.
+// Original historical polarity labels are deliberately omitted (backpainted).
+bbEnabled = input.bool(true, "Enable breaker entries", group="Breaker entries")
+bbMode = input.string("Either", "Entry trigger", options=["Retest", "Break close", "Either"], group="Breaker entries")
+bbBias = input.bool(true, "Require closed 15m bias", group="Breaker entries")
+bbStructure = input.bool(false, "Require Fusion structure direction", group="Breaker entries")
+bbLength = input.int(10, "Swing lookback", minval=3, maxval=100, group="Breaker entries")
+bbBody = input.bool(false, "Use candle bodies for zone boundaries", group="Breaker entries")
+bbAge = input.int(100, "Breaker expiry bars after break", minval=1, maxval=500, group="Breaker entries")
+bbScan = input.int(1000, "Maximum bars from swing / OB lifetime", minval=20, maxval=2000, group="Breaker entries")
+bbCapacity = input.int(30, "Maximum tracked blocks per origin direction", minval=1, maxval=60, group="Breaker entries")
+bbShow = input.bool(true, "Show order / breaker zones", group="Breaker entries")
+bbPanel = input.bool(true, "Show breaker counts", group="Breaker entries")
+bbLongColor = input.color(color.lime, "Bullish breaker", group="Breaker entries")
+bbShortColor = input.color(color.fuchsia, "Bearish breaker", group="Breaker entries")
+
+type BbSwing
+    float price = na
+    int index = na
+    bool crossed = false
+
+type BbBlock
+    float top
+    float bottom
+    int originTime
+    int detectedBar
+    bool broken = false
+    int breakBar = na
+    bool entered = false
+    box area = na
+
+// LuxAlgo's alternating swing state, confirmed before use.
+bbSwings(int length) =>
+    var int state = 0
+    var BbSwing hi = BbSwing.new()
+    var BbSwing lo = BbSwing.new()
+    float upper = ta.highest(high, length)
+    float lower = ta.lowest(low, length)
+    if ready and bar_index >= length
+        int nextState = high[length] > upper ? 0 : low[length] < lower ? 1 : state
+        if nextState == 0 and state != 0
+            hi := BbSwing.new(high[length], bar_index - length)
+        if nextState == 1 and state != 1
+            lo := BbSwing.new(low[length], bar_index - length)
+        state := nextState
+    [hi, lo]
+
+bbDelete(BbBlock block) =>
+    box.delete(block.area)
+
+[bbSwingHigh, bbSwingLow] = bbSwings(bbLength)
+bbHigh = bbBody ? math.max(open, close) : high
+bbLow = bbBody ? math.min(open, close) : low
+var array<BbBlock> bbBullObs = array.new<BbBlock>()
+var array<BbBlock> bbBearObs = array.new<BbBlock>()
+var int bbBullFormed = 0
+var int bbBearFormed = 0
+var int bbLongCount = 0
+var int bbShortCount = 0
+var int bbExpired = 0
+var int bbInvalidated = 0
+float btBreakerLongTop = na
+float btBreakerLongBottom = na
+float btBreakerShortTop = na
+float btBreakerShortBottom = na
+bool bbLongSignal = false
+bool bbShortSignal = false
+
+if ready
+    if not na(bbSwingHigh.price) and not bbSwingHigh.crossed and close > bbSwingHigh.price
+        bbSwingHigh.crossed := true
+        int distance = bar_index - bbSwingHigh.index
+        if distance > 1 and distance <= bbScan
+            float lowest = bbLow[1]
+            float pairedHigh = bbHigh[1]
+            int origin = time[1]
+            for j = 1 to distance - 1
+                if bbLow[j] <= lowest
+                    lowest := bbLow[j]
+                    pairedHigh := bbHigh[j]
+                    origin := time[j]
+            box drawing = na
+            if bbShow
+                drawing := box.new(origin, pairedHigh, time_close, lowest, xloc=xloc.bar_time, border_color=color.new(color.blue, 50), bgcolor=color.new(color.blue, 94), text="Bull OB", text_color=color.blue, text_size=size.tiny)
+            array.unshift(bbBullObs, BbBlock.new(pairedHigh, lowest, origin, bar_index, area=drawing))
+            if array.size(bbBullObs) > bbCapacity
+                bbDelete(array.pop(bbBullObs))
+
+    if not na(bbSwingLow.price) and not bbSwingLow.crossed and close < bbSwingLow.price
+        bbSwingLow.crossed := true
+        int distance = bar_index - bbSwingLow.index
+        if distance > 1 and distance <= bbScan
+            float highest = bbHigh[1]
+            float pairedLow = bbLow[1]
+            int origin = time[1]
+            for j = 1 to distance - 1
+                if bbHigh[j] >= highest
+                    highest := bbHigh[j]
+                    pairedLow := bbLow[j]
+                    origin := time[j]
+            box drawing = na
+            if bbShow
+                drawing := box.new(origin, highest, time_close, pairedLow, xloc=xloc.bar_time, border_color=color.new(color.orange, 50), bgcolor=color.new(color.orange, 94), text="Bear OB", text_color=color.orange, text_size=size.tiny)
+            array.unshift(bbBearObs, BbBlock.new(highest, pairedLow, origin, bar_index, area=drawing))
+            if array.size(bbBearObs) > bbCapacity
+                bbDelete(array.pop(bbBearObs))
+
+    // Bullish OB fails downward -> bearish breaker (resistance).
+    if array.size(bbBullObs) > 0
+        for j = array.size(bbBullObs) - 1 to 0
+            BbBlock block = array.get(bbBullObs, j)
+            bool newBreak = false
+            bool removeBlock = false
+            if not block.broken
+                if bar_index > block.detectedBar and close < block.bottom
+                    block.broken := true
+                    block.breakBar := bar_index
+                    newBreak := true
+                    bbBearFormed += 1
+                    if bbShow
+                        box.set_text(block.area, "BEAR BREAKER")
+                        box.set_text_color(block.area, bbShortColor)
+                        box.set_border_color(block.area, bbShortColor)
+                        box.set_border_style(block.area, line.style_dashed)
+                        box.set_bgcolor(block.area, color.new(bbShortColor, 89))
+                        box.set_left(block.area, time)
+                else if bar_index - block.detectedBar > bbScan
+                    removeBlock := true
+                    bbExpired += 1
+            if block.broken
+                if close > block.top
+                    removeBlock := true
+                    bbInvalidated += 1
+                else if bar_index - block.breakBar > bbAge
+                    removeBlock := true
+                    bbExpired += 1
+                bool overlap = high >= block.bottom and low <= block.top
+                bool retest = bar_index > block.breakBar and overlap and close < block.bottom and close < open
+                bool trigger = bbMode == "Break close" ? newBreak : bbMode == "Retest" ? retest : newBreak or retest
+                bool permitted = bbEnabled and not block.entered and not removeBlock and (not bbBias or biasShort) and (not bbStructure or fxDirection == -1)
+                if trigger and permitted
+                    bbShortSignal := true
+                    btBreakerShortTop := block.top
+                    btBreakerShortBottom := block.bottom
+                    block.entered := true
+            if bbShow and not removeBlock
+                box.set_right(block.area, time_close)
+            if removeBlock
+                bbDelete(block)
+                array.remove(bbBullObs, j)
+
+    // Bearish OB fails upward -> bullish breaker (support).
+    if array.size(bbBearObs) > 0
+        for j = array.size(bbBearObs) - 1 to 0
+            BbBlock block = array.get(bbBearObs, j)
+            bool newBreak = false
+            bool removeBlock = false
+            if not block.broken
+                if bar_index > block.detectedBar and close > block.top
+                    block.broken := true
+                    block.breakBar := bar_index
+                    newBreak := true
+                    bbBullFormed += 1
+                    if bbShow
+                        box.set_text(block.area, "BULL BREAKER")
+                        box.set_text_color(block.area, bbLongColor)
+                        box.set_border_color(block.area, bbLongColor)
+                        box.set_border_style(block.area, line.style_dashed)
+                        box.set_bgcolor(block.area, color.new(bbLongColor, 89))
+                        box.set_left(block.area, time)
+                else if bar_index - block.detectedBar > bbScan
+                    removeBlock := true
+                    bbExpired += 1
+            if block.broken
+                if close < block.bottom
+                    removeBlock := true
+                    bbInvalidated += 1
+                else if bar_index - block.breakBar > bbAge
+                    removeBlock := true
+                    bbExpired += 1
+                bool overlap = high >= block.bottom and low <= block.top
+                bool retest = bar_index > block.breakBar and overlap and close > block.top and close > open
+                bool trigger = bbMode == "Break close" ? newBreak : bbMode == "Retest" ? retest : newBreak or retest
+                bool permitted = bbEnabled and not block.entered and not removeBlock and (not bbBias or biasLong) and (not bbStructure or fxDirection == 1)
+                if trigger and permitted
+                    bbLongSignal := true
+                    btBreakerLongTop := block.top
+                    btBreakerLongBottom := block.bottom
+                    block.entered := true
+            if bbShow and not removeBlock
+                box.set_right(block.area, time_close)
+            if removeBlock
+                bbDelete(block)
+                array.remove(bbBearObs, j)
+
+    // Count signal bars, even when more than one block qualifies on that bar.
+    if bbLongSignal
+        bbLongCount += 1
+    if bbShortSignal
+        bbShortCount += 1
+
+plotshape(bbLongSignal, title="BULL BREAKER ENTRY", style=shape.labelup, location=location.belowbar, color=bbLongColor, text="BREAKER\nLONG", textcolor=color.black, size=size.small)
+plotshape(bbShortSignal, title="BEAR BREAKER ENTRY", style=shape.labeldown, location=location.abovebar, color=bbShortColor, text="BREAKER\nSHORT", textcolor=color.white, size=size.small)
+var table bbTable = table.new(position.bottom_left, 2, 5, border_width=1)
+if barstate.islast
+    table.clear(bbTable, 0, 0, 1, 4)
+    if bbPanel
+        table.cell(bbTable, 0, 0, "BREAKER / " + bbMode, text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.tiny)
+        table.cell(bbTable, 1, 0, bbEnabled ? "ON" : "OFF", text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 0, 1, "Formed bull / bear", text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 1, 1, str.tostring(bbBullFormed) + " / " + str.tostring(bbBearFormed), text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 0, 2, "Entry bars long / short", text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 1, 2, str.tostring(bbLongCount) + " / " + str.tostring(bbShortCount), text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 0, 3, "Expired / invalidated", text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 1, 3, str.tostring(bbExpired) + " / " + str.tostring(bbInvalidated), text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 0, 4, "15m bias / structure", text_color=color.white, text_size=size.tiny)
+        table.cell(bbTable, 1, 4, (bbBias ? "ON" : "OFF") + " / " + (bbStructure ? "ON" : "OFF"), text_color=color.white, text_size=size.tiny)
+
+
+// Entries are market orders filled at the next available bar open, with the
+// strategy's slippage. Stop/target are frozen using the ACTUAL simulated fill.
+varip float btZoneTop = na
+varip float btZoneBottom = na
+varip float btTradeStop = na
+varip float btTradeTarget = na
+varip int btEntryBar = na
+varip bool btTradeIsBreaker = false
+var int btConflicts = 0
+bool btInRange = time >= btStart and time < btEnd
+bool btLong = btFamily == "IFVG" ? longSignal : bbLongSignal
+bool btShort = btFamily == "IFVG" ? shortSignal : bbShortSignal
+
+if btFillPass and strategy.position_size != 0
+    float actualRisk = strategy.position_size > 0 ? strategy.position_avg_price - btTradeStop : btTradeStop - strategy.position_avg_price
+    if actualRisk <= 0
+        strategy.close_all(comment="Gap past stop", immediately=true, disable_alert=true)
+    else
+        btTradeTarget := math.round_to_mintick(strategy.position_avg_price + (strategy.position_size > 0 ? 1 : -1) * actualRisk * btRR)
+
+if strategy.position_size > 0 and not na(btTradeTarget)
+    strategy.exit("Risk exit", "Long", stop=btTradeStop, limit=btTradeTarget, disable_alert=true)
+if strategy.position_size < 0 and not na(btTradeTarget)
+    strategy.exit("Risk exit", "Short", stop=btTradeStop, limit=btTradeTarget, disable_alert=true)
+
+if ready
+    if btInRange and strategy.position_size == 0 and (na(btEntryBar) or bar_index > btEntryBar)
+        if btLong and btShort
+            btConflicts += 1
+        else if btLong or btShort
+            float top = btFamily == "IFVG" ? (btLong ? btIfvgLongTop : btIfvgShortTop) : (btLong ? btBreakerLongTop : btBreakerShortTop)
+            float bottom = btFamily == "IFVG" ? (btLong ? btIfvgLongBottom : btIfvgShortBottom) : (btLong ? btBreakerLongBottom : btBreakerShortBottom)
+            float stop = btLong ? bottom - btBuffer * syminfo.mintick : top + btBuffer * syminfo.mintick
+            bool validRisk = not na(top) and not na(bottom) and (btLong ? close > stop : close < stop)
+            if validRisk
+                btZoneTop := top
+                btZoneBottom := bottom
+                btTradeStop := stop
+                btTradeTarget := na
+                btTradeIsBreaker := btFamily == "Breakers"
+                btEntryBar := bar_index
+                if btLong
+                    strategy.entry("Long", strategy.long, qty=1, comment=btFamily + " LONG", disable_alert=true)
+                    strategy.exit("Risk exit", "Long", stop=btTradeStop, disable_alert=true)
+                else
+                    strategy.entry("Short", strategy.short, qty=1, comment=btFamily + " SHORT", disable_alert=true)
+                    strategy.exit("Risk exit", "Short", stop=btTradeStop, disable_alert=true)
+
+    if strategy.position_size != 0
+        bool isLong = strategy.position_size > 0
+        bool zoneFailed = isLong ? close < btZoneBottom : close > btZoneTop
+        bool directionFailed = btTradeIsBreaker ? ((bbBias and (isLong ? not biasLong : not biasShort)) or (bbStructure and (isLong ? fxDirection != 1 : fxDirection != -1))) : ((isLong ? not biasLong : not biasShort) or (fxFilterStructure and (isLong ? fxDirection != 1 : fxDirection != -1)))
+        if btInvalidate and (zoneFailed or directionFailed)
+            strategy.close_all(comment=zoneFailed ? "Zone invalidated" : "Direction invalidated", disable_alert=true)
+        else if time >= btEnd
+            strategy.close_all(comment="Test ended", disable_alert=true)
+
+plot(strategy.position_size != 0 ? btTradeStop : na, "Backtest stop", color.red, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? btTradeTarget : na, "Backtest 2R target", color.green, style=plot.style_linebr)
+
+
