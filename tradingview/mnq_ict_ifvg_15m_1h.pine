@@ -137,7 +137,7 @@ invertLong = barstate.isconfirmed and not na(bearGapTop) and bar_index > bearGap
 invertShort = barstate.isconfirmed and not na(bullGapBottom) and bar_index > bullGapBar and close < bullGapBottom and close[1] >= bullGapBottom
 
 validSymbol = str.contains(str.upper(syminfo.ticker), "MNQ") or str.contains(str.upper(syminfo.ticker), "NQ")
-validTime = timeframe.isminutes and timeframe.multiplier == 5
+validTime = timeframe.isminutes and timeframe.multiplier == 15
 ready = barstate.isconfirmed and validSymbol and validTime
 // Expire pending stages and invalidate when 1h bias flips.
 if barstate.isconfirmed
