@@ -1,5 +1,5 @@
 //@version=6
-indicator("MNQ ICT IFVG Signals v5", overlay=true, max_labels_count=500, max_boxes_count=200)
+indicator("MNQ ICT IFVG Signals v6", overlay=true, max_labels_count=500, max_boxes_count=200)
 
 // Signal-only research indicator. No broker orders or risk execution.
 pivotStrength = input.int(3, "Confirmed swing pivot strength", minval=1, maxval=20)
@@ -17,6 +17,7 @@ detailed = displayMode == "Detailed"
 clean = displayMode == "Clean"
 entriesOnly = displayMode == "Entries Only"
 showBias = input.bool(true, "Show 15m bias")
+showDiagnostics = input.bool(true, "Show signal diagnostics")
 
 // Display mode affects chart markers only; signal conditions and alert triggers are unchanged.
 // Last CLOSED 15m candle only, avoiding developing 15m bar repaint.
@@ -55,6 +56,18 @@ var int shortDisplaceBar = na
 var int longType = 0  // 1 SWEEP, 2 MSS
 var int shortType = 0
 
+// Cumulative counts over loaded chart history; a candidate is counted when idle.
+var int detectedSweep = 0
+var int detectedMss = 0
+var int confirmedDisplacement = 0
+var int rejectedBias = 0
+var int expiredBeforeDisplacement = 0
+var int expiredBeforeIfvg = 0
+var int invalidatedBias = 0
+var int confirmedEntries = 0
+var int confirmedLongs = 0
+var int confirmedShorts = 0
+
 // Track one newest bearish and bullish three-candle FVG.
 var float bearGapBottom = na
 var float bullGapTop = na
@@ -81,21 +94,29 @@ ready = barstate.isconfirmed and validSymbol and validTime
 // Expire pending stages and invalidate when 15m bias flips.
 if barstate.isconfirmed
     if longStage == 1 and bar_index - longSetupBar > displacementWindow
+        expiredBeforeDisplacement += 1
         longStage := 0
         longType := 0
     if shortStage == 1 and bar_index - shortSetupBar > displacementWindow
+        expiredBeforeDisplacement += 1
         shortStage := 0
         shortType := 0
     if longStage == 2 and bar_index - longDisplaceBar > inversionWindow
+        expiredBeforeIfvg += 1
         longStage := 0
         longType := 0
     if shortStage == 2 and bar_index - shortDisplaceBar > inversionWindow
+        expiredBeforeIfvg += 1
         shortStage := 0
         shortType := 0
     if not biasLong
+        if longStage != 0
+            invalidatedBias += 1
         longStage := 0
         longType := 0
     if not biasShort
+        if shortStage != 0
+            invalidatedBias += 1
         shortStage := 0
         shortType := 0
 
@@ -125,6 +146,14 @@ if showZones and not entriesOnly and longSignal and not na(bearGapBottom)
 if showZones and not entriesOnly and shortSignal and not na(bullGapTop)
     box.new(left=bullGapBar, top=bullGapTop, right=bar_index, bottom=bullGapBottom, border_color=color.red, bgcolor=color.new(color.red, 88))
 
+// Count completed signals without modifying eligibility.
+if longSignal
+    confirmedEntries += 1
+    confirmedLongs += 1
+if shortSignal
+    confirmedEntries += 1
+    confirmedShorts += 1
+
 // Consume each confirmed setup once.
 if longSignal
     longStage := 0
@@ -137,14 +166,22 @@ if shortSignal
 if ready
     if longStage == 1 and bar_index > longSetupBar and bullDisplacement
         longStage := 2
+        confirmedDisplacement += 1
         longDisplaceBar := bar_index
         if detailed
             label.new(bar_index, low, "2 DISP UP", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
     if shortStage == 1 and bar_index > shortSetupBar and bearDisplacement
         shortStage := 2
+        confirmedDisplacement += 1
         shortDisplaceBar := bar_index
         if detailed
             label.new(bar_index, high, "2 DISP DOWN", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+    // Count only otherwise eligible idle setup candidates blocked by HTF bias.
+    if longStage == 0 and not longSignal and not biasLong and ((allowSweep and bullSweep) or (allowMss and bullMss))
+        rejectedBias += 1
+    if shortStage == 0 and not shortSignal and not biasShort and ((allowSweep and bearSweep) or (allowMss and bearMss))
+        rejectedBias += 1
 
     // Stage 1: arm only while idle; favor SWEEP when both qualify.
     if longStage == 0 and not longSignal and biasLong
@@ -152,12 +189,14 @@ if ready
             longStage := 1
             longSetupBar := bar_index
             longType := 1
+            detectedSweep += 1
             if detailed
                 label.new(bar_index, low, "1 SWEEP", color=color.green, textcolor=color.white, size=size.tiny)
         else if allowMss and bullMss
             longStage := 1
             longSetupBar := bar_index
             longType := 2
+            detectedMss += 1
             if detailed
                 label.new(bar_index, low, "1 MSS", color=color.teal, textcolor=color.white, size=size.tiny)
     if shortStage == 0 and not shortSignal and biasShort
@@ -165,12 +204,14 @@ if ready
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 1
+            detectedSweep += 1
             if detailed
                 label.new(bar_index, high, "1 SWEEP", color=color.red, textcolor=color.white, size=size.tiny)
         else if allowMss and bearMss
             shortStage := 1
             shortSetupBar := bar_index
             shortType := 2
+            detectedMss += 1
             if detailed
                 label.new(bar_index, high, "1 MSS", color=color.orange, textcolor=color.white, size=size.tiny)
 
@@ -198,3 +239,29 @@ if barstate.isconfirmed and bar_index >= 2
 var table biasPanel = table.new(position.top_right, 1, 1)
 if barstate.islast
     table.cell(biasPanel, 0, 0, showBias ? (biasLong ? "15m BIAS: LONG" : biasShort ? "15m BIAS: SHORT" : "15m BIAS: NEUTRAL") : "", text_color=color.white, bgcolor=showBias ? (biasLong ? color.green : biasShort ? color.red : color.gray) : color.new(color.black, 100))
+
+var table diagnosticPanel = table.new(position.bottom_right, 2, 10, border_width=1)
+if barstate.islast
+    if showDiagnostics
+        table.cell(diagnosticPanel, 0, 0, "V6 DIAGNOSTICS", text_color=color.white, bgcolor=color.new(color.blue, 45))
+        table.cell(diagnosticPanel, 1, 0, "COUNT", text_color=color.white, bgcolor=color.new(color.blue, 45))
+        table.cell(diagnosticPanel, 0, 1, "SWEEP armed", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 1, str.tostring(detectedSweep), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 2, "MSS armed", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 2, str.tostring(detectedMss), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 3, "Displacement", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 3, str.tostring(confirmedDisplacement), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 4, "Bias rejected", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 4, str.tostring(rejectedBias), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 5, "Setup expired", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 5, str.tostring(expiredBeforeDisplacement), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 6, "IFVG wait expired", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 6, str.tostring(expiredBeforeIfvg), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 7, "Bias invalidated", text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 1, 7, str.tostring(invalidatedBias), text_color=color.white, bgcolor=color.new(color.black, 35))
+        table.cell(diagnosticPanel, 0, 8, "LONG entries", text_color=color.white, bgcolor=color.new(color.green, 50))
+        table.cell(diagnosticPanel, 1, 8, str.tostring(confirmedLongs), text_color=color.white, bgcolor=color.new(color.green, 50))
+        table.cell(diagnosticPanel, 0, 9, "SHORT entries", text_color=color.white, bgcolor=color.new(color.red, 50))
+        table.cell(diagnosticPanel, 1, 9, str.tostring(confirmedShorts), text_color=color.white, bgcolor=color.new(color.red, 50))
+    else
+        table.clear(diagnosticPanel, 0, 0, 1, 9)
