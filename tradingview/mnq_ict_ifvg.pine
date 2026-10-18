@@ -464,7 +464,7 @@ if barstate.islast
     table.cell(biasPanel, 0, 0, showBias ? (biasLong ? "15m BIAS: LONG" : biasShort ? "15m BIAS: SHORT" : "15m BIAS: NEUTRAL") : "", text_color=color.white, bgcolor=showBias ? (biasLong ? color.green : biasShort ? color.red : color.gray) : color.new(color.black, 100))
 
 
-var table diagnosticPanel = table.new(diagPosition, 2, 16, border_width=1)
+var table diagnosticPanel = table.new(diagPosition, 2, 17, border_width=1)
 if barstate.islast
     if showDiagnostics
         table.cell(diagnosticPanel, 0, 0, "V7: STRICT / NO BIAS", text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=diagSize)
@@ -502,4 +502,4 @@ if barstate.islast
         table.cell(diagnosticPanel, 0, 16, "Bull FVG expired", text_color=color.white, text_size=diagSize)
         table.cell(diagnosticPanel, 1, 16, str.tostring(bullishGapExpired), text_color=color.white, text_size=diagSize)
     else
-        table.clear(diagnosticPanel, 0, 0, 1, 15)
+        table.clear(diagnosticPanel, 0, 0, 1, 16)
